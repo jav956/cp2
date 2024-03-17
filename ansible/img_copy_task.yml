@@ -1,0 +1,18 @@
+# Descarga de la imagen al repositorio local (PULL)
+- name: PULL - "{{ item.src_path + '/' + item.repo + ':' + item.src_version }}"
+  containers.podman.podman_image:
+    name: "{{ item.src_path + '/' + item.repo + ':' + item.src_version }}"
+# Reetiquetado de la imagen con nuevo destino
+- name: TAG - {{ item.src_path + '/'  + item.repo + ':' + item.src_version }} -> "{{ item.dst_path + '/'  + item.repo + ':' + item.dst_version }}"
+  containers.podman.podman_tag:
+    image: "{{ item.src_path + '/'  + item.repo + ':' + item.src_version }}"
+    target_names:
+      - "{{ item.dst_path + '/'  + item.repo + ':' + item.dst_version }}"
+# Subida imagen a nuevo repositorio destino (PUSH)
+- name: PUSH - {{ item.dst_path + '/'  + item.repo + ':' + item.dst_version }}
+  containers.podman.podman_image:
+    name: "{{ item.dst_path + '/'  + item.repo + ':' + item.dst_version }}"
+    pull: false
+    push: true
+    username: "{{ username }}"
+    password: "{{ password }}"

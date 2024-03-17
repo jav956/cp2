@@ -1,0 +1,154 @@
+---
+- hosts: localhost
+  gather_facts: false
+  vars:
+    # Importacion de los outputs de terraform a variable tf
+    tf: "{{ lookup('cloud.terraform.tf_output',  project_path=playbook_dir+'/../terraform') }}"
+    nginx_username: "cp2"
+    # Se genera password que se usará para la autenticación basica en la imagen nginx
+    nginx_password: "{{ lookup('ansible.builtin.password', 'build/nginx_passwd') }}"
+  tasks:
+    # Extraemos a fichero la clave privada de la vm del tfstate
+    - name: Creación carpeta build 
+      file: 
+        path: "build"
+        state: directory
+    - name: Guardar como fichero la clave privada de acceso a la VM 
+      copy: 
+        content: "{{ tf.vm_admin_private_key.value }}" 
+        dest: build/vm_ssh_private_key
+        mode: 0700
+
+    # Generamos los ficheros necesarios para preparar la imagen de nginx
+    # Fichero de password para autenticación básica (.htpasswd)
+    - name: nginx:casopractico2 - basic_auth .htpasswd
+      community.general.htpasswd:
+        path: "build/.htpasswd"
+        name: "{{ nginx_username }}"
+        password: "{{ nginx_password }}"
+    # Clave privada para conexión https (server.key)
+    - name: nginx:casopractico2 - SSL private key - server.key
+      community.crypto.openssl_privatekey:
+        path: "build/server.key"
+    # Paso intermedio, solicitud de firma de certificado (CSR)
+    - name: nginx:casopractico2 - SSL CSR
+      community.crypto.openssl_csr:
+        path: "build/server.csr"
+        privatekey_path: "build/server.key"
+        country_name: "ES"
+        organization_name: "UNIR"
+        email_address: "josealejandro.varela956@comunidadunir.net"
+        common_name: "cp2_nginx"
+    # Certificado público autofirmado (server.pem)
+    - name: nginx:casopractico2 - SSL self-signed cert - server.pem
+      community.crypto.x509_certificate:
+        path: "build/server.pem"
+        privatekey_path: "build/server.key"
+        csr_path: "build/server.csr"
+        provider: selfsigned
+
+    # Se genera la imagen nginx:casopractico2
+    - name: nginx:casopractico2 - Build
+      containers.podman.podman_image:
+        name: "nginx:casopractico2"
+        path: .
+        build:
+          file: "vm_nginx_Dockerfile"
+        pull: false
+    # Mostramos por pantalla las credenciales que se han generado para la imagen nginx:casopractico2
+    - name: Credenciales nginx:casopractico2
+      ansible.builtin.debug:
+        msg:
+          - "IP: {{ hostvars['vm'].ansible_host }}"
+          - "username: {{ nginx_username }}"
+          - "password: {{ nginx_password }}"
+
+    # Se copian las imagenes necesarias para la aplicacion kubernetes a desplegar en AKS
+    # Descarga -> Reetiquetado -> PUSH en tarea img_copy.yml
+    - name: Copia imagenes a ACR
+      ansible.builtin.include_tasks:
+        file: "img_copy_task.yml"
+      vars:
+        username: "{{ tf.acr_admin_username.value }}"
+        password: "{{ tf.acr_admin_password.value }}"
+      loop:
+        - { repo: "nginx", src_path: "localhost", src_version: "casopractico2", dst_path: "{{ tf.acr_login_server.value }}/vm", dst_version: "casopractico2" }
+        - { repo: "azure-vote-front", src_path: "mcr.microsoft.com/azuredocs", src_version: "v1", dst_path: "{{ tf.acr_login_server.value }}/aks", dst_version: "casopractico2" }
+        - { repo: "redis", src_path: "mcr.microsoft.com/oss/bitnami", src_version: "6.0.8", dst_path: "{{ tf.acr_login_server.value }}/aks", dst_version: "casopractico2" }
+
+
+# Provisionado de la VM
+- hosts: vm
+  remote_user: "{{ tf.vm_admin_username.value }}"
+  become: true
+  vars:
+     tf: "{{ lookup('cloud.terraform.tf_output',  project_path=playbook_dir+'/../terraform') }}"
+     ansible_ssh_private_key_file: "build/vm_ssh_private_key"
+  tasks:
+    # Se instala el paquete podman en la VM
+    - name: Instalando podman
+      ansible.builtin.apt:
+        name: podman
+        state: present
+    # Se hace pull de la imagen nginx:casopractico2 desde el ACR
+    - name: PULL de la imagen del ACR - {{ tf.acr_login_server.value }}/vm/nginx:casopractico2
+      containers.podman.podman_image:
+        name: "{{ tf.acr_login_server.value }}/vm/nginx:casopractico2"
+        username: "{{ tf.acr_admin_username.value }}"
+        password: "{{ tf.acr_admin_password.value }}"
+    # Se inicia instancia de la imagen nginx:casopractico2
+    - name: Ejecutando contenedor casopractico2
+      containers.podman.podman_container:
+        name: casopractico2
+        image: "{{ tf.acr_login_server.value }}/vm/nginx:casopractico2"
+        ports:
+          - "443:443"
+        state: started
+        # Se genera servicio systemd para control del contenedor como se solicita en la actividad
+        generate_systemd:
+          container_prefix: container
+          names: true
+          path: /etc/systemd/system
+          # El servicio reiniciara el conteneder en caso de fallo
+          restart_policy: always
+    # Se configura el servicio del contenedor para que arranque con el sistema
+    - name: Configurando servicio systemd container-casopractico2
+      ansible.builtin.systemd_service:
+        name: container-casopractico2
+        state: started
+        enabled: true
+
+# Despliegue de la aplicación en AKS
+- hosts: localhost
+  gather_facts: false
+  vars:
+    tf: "{{ lookup('cloud.terraform.tf_output',  project_path=playbook_dir+'/../terraform') }}"
+  tasks:
+    # Extraemos fichero configuración de kubernetes del tfstate
+    - name: Se guarda como fichero con configuración/credenciales del AKS
+      copy: 
+        content: "{{ tf.aks_kube_config.value }}" 
+        dest: "build/kube_config"
+    # Se despliega la aplicación en el AKS
+    - name: k8s
+      kubernetes.core.k8s:
+        kubeconfig: "build/kube_config"
+        state: present
+        template:
+          - path: 'azure-vote-all-in-one-redis.yaml.j2'
+    # Esperamos hasta obtener la IP pública asignada al servicio
+    - name: Esperando IP pública de acceso a la aplicación
+      kubernetes.core.k8s_info:
+        kubeconfig: "build/kube_config"
+        api_version: v1
+        kind: Service
+        name: azure-vote-front
+        namespace: default
+      register: gateway_service
+      until: gateway_service.resources[0].status.loadBalancer.ingress[0].ip is defined
+      retries: 10
+      delay: 10
+    # Se muesta la IP de acceso en pantalla  
+    - name: IP de la aplicación
+      ansible.builtin.debug:
+        var: gateway_service.resources[0].status.loadBalancer.ingress[0].ip

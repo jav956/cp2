@@ -1,0 +1,5 @@
+FROM docker.io/nginx
+COPY vm_nginx.conf    /etc/nginx/conf.d/cp2.conf
+COPY build/.htpasswd  /etc/nginx/conf.d/cp2/.htpasswd
+COPY build/server.pem /etc/nginx/conf.d/cp2/server.pem
+COPY build/server.key /etc/nginx/conf.d/cp2/server.key
